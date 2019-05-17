@@ -301,7 +301,7 @@ func (f *Fs) put(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, put p
 	pipeReader, pipeWriter := io.Pipe()
 	compressionError := make(chan error)
 	go func() {
-		err := f.c.CompressFile(in, 0, pipeWriter)
+		err := f.c.CompressFileAppendingBlockData(in, pipeWriter)
 		closeErr := pipeWriter.Close()
 		if closeErr != nil {
 			fs.Errorf(nil, "Failed to close compression pipe: %v", err)
@@ -512,7 +512,7 @@ func (f *Fs) PutUnchecked(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOpt
 	pipeReader, pipeWriter := io.Pipe()
 	compressionError := make(chan error)
 	go func() {
-		err := f.c.CompressFile(in, 0, pipeWriter)
+		err := f.c.CompressFileAppendingBlockData(in, pipeWriter)
 		compressionError <- err
 	}()
 	wrappedIn = wrap(bufio.NewReaderSize(pipeReader, bufferSize)) // Required for multithreading

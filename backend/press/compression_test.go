@@ -17,7 +17,7 @@ const TestStringSmall = "The quick brown fox jumps over the lazy dog."
 const TestSizeLarge = 2097152 // 2 megabytes
 
 // Tests compression and decompression for a preset
-func testCompressDecompress(t *testing.T, preset string, testString string) {
+func testCompressDecompress(t *testing.T, preset string, testString string, externalData bool) {
 	// Create compression instance
 	comp, err := NewCompressionPreset(preset)
 	if err != nil {
@@ -48,7 +48,12 @@ func testCompressDecompress(t *testing.T, preset string, testString string) {
 			t.Log("Failed to close compressed file")
 		}
 	}()
-	err = comp.CompressFile(testFileReader, 0, compressedFile)
+	var blockData []uint32
+	if externalData {
+		blockData, err = comp.CompressFileReturningBlockData(testFileReader, compressedFile)
+	} else {
+		err = comp.CompressFileAppendingBlockData(testFileReader, compressedFile)
+	}
 	if err != nil {
 		t.Fatalf("Compression failed with error: %v", err)
 	}
@@ -66,7 +71,13 @@ func testCompressDecompress(t *testing.T, preset string, testString string) {
 	t.Logf("Compressed size: %d\n", size)
 
 	// Decompress file into a hasher
-	FileHandle, decompressedSize, err := comp.DecompressFile(compressedFile, size)
+	var FileHandle io.ReadSeeker
+	var decompressedSize int64
+	if externalData {
+		FileHandle, decompressedSize, err = comp.DecompressFileExtData(compressedFile, size, blockData)
+	} else {
+		FileHandle, decompressedSize, err = comp.DecompressFile(compressedFile, size)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,11 +100,32 @@ func testCompressDecompress(t *testing.T, preset string, testString string) {
 	}
 
 	// Compare hashes
-	t.Logf("Hash of original file: %x\n", testFileHash)
-	t.Logf("Hash of recovered file: %x\n", decompressedFileHash)
 	if !bytes.Equal(testFileHash, decompressedFileHash) {
+		t.Logf("Hash of original file: %x\n", testFileHash)
+		t.Logf("Hash of recovered file: %x\n", decompressedFileHash)
 		t.Fatal("Hashes do not match!")
 	}
+}
+
+// Tests both small and large strings for a preset
+func testSmallLarge(t *testing.T, preset string, externalData bool) {
+	testStringLarge := getCompressibleString(TestSizeLarge)
+	t.Run("TestSmall", func(t *testing.T) {
+		testCompressDecompress(t, preset, TestStringSmall, externalData)
+	})
+	t.Run("TestLarge", func(t *testing.T) {
+		testCompressDecompress(t, preset, testStringLarge, externalData)
+	})
+}
+
+// Tests both appended and external data modes for a preset
+func testInternalExternal(t *testing.T, preset string) {
+	t.Run("TestExternal", func(t *testing.T) {
+		testSmallLarge(t, preset, true)
+	})
+	t.Run("TestAppended", func(t *testing.T) {
+		testSmallLarge(t, preset, false)
+	})
 }
 
 // Gets a compressible string
@@ -107,40 +139,16 @@ func getCompressibleString(size int) string {
 	return encoding.EncodeToString(prbytes)[:size]
 }
 
-// Tests LZ4
-func TestLZ4CompressSmall(t *testing.T) {
-	testCompressDecompress(t, "lz4", TestStringSmall)
-}
-func TestLZ4CompressLarge(t *testing.T) {
-	testCompressDecompress(t, "lz4", getCompressibleString(TestSizeLarge))
-}
-
-// Tests Snappy
-func TestSnappyCompressSmall(t *testing.T) {
-	testCompressDecompress(t, "snappy", TestStringSmall)
-}
-func TestSnappyCompressLarge(t *testing.T) {
-	testCompressDecompress(t, "snappy", getCompressibleString(TestSizeLarge))
-}
-
-// Tests GZIP
-func TestGzipCompressSmall(t *testing.T) {
-	testCompressDecompress(t, "gzip-min", TestStringSmall)
-}
-func TestGzipCompressLarge(t *testing.T) {
-	testCompressDecompress(t, "gzip-min", getCompressibleString(TestSizeLarge))
-}
-
-// Tests XZ
-func TestXZCompressSmall(t *testing.T) {
-	if !checkXZ() {
-		t.Skip("XZ binary not found on current system")
+func TestCompression(t *testing.T) {
+	testCases := []string{"lz4", "snappy", "gzip-min"}
+	if checkXZ() {
+		testCases = append(testCases, "xz-min")
+	} else {
+		t.Log("XZ binary not found on current system. Not testing xz.")
 	}
-	testCompressDecompress(t, "xz-min", TestStringSmall)
-}
-func TestXZCompressLarge(t *testing.T) {
-	if !checkXZ() {
-		t.Skip("XZ binary not found on current system")
+	for _, tc := range testCases {
+		t.Run(tc, func(t *testing.T) {
+			testInternalExternal(t, tc)
+		})
 	}
-	testCompressDecompress(t, "xz-min", getCompressibleString(TestSizeLarge))
 }
