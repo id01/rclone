@@ -31,14 +31,15 @@ import (
 
 // Compression modes
 const (
-	GzipStore = iota
-	GzipMin
-	GzipDefault
-	GzipMax
-	XzInGzMin
-	XzInGz
-	LZ4
-	Snappy
+	Uncompressed = -1
+	GzipStore = 0
+	GzipMin = 1
+	GzipDefault = 2
+	GzipMax = 3
+	LZ4 = 4
+	Snappy = 5
+	XzInGzMin = 6
+	XzInGz = 7
 )
 
 // Errors
@@ -76,6 +77,27 @@ func NewCompressionPreset(preset string) (*Compression, error) {
 	case "xz-min":
 		return NewCompression(XzInGzMin, 524288) // XZ-min compression (slow)
 	case "xz-default":
+		return NewCompression(XzInGz, 1048576) // XZ-default compression (very slow)
+	}
+	return nil, errors.New("Compression mode doesn't exist")
+}
+
+// NewCompressionPresetNumber creates a Compression object with a preset mode/bs
+func NewCompressionPresetNumber(preset int) (*Compression, error) {
+	switch preset {
+	case GzipStore:
+		return NewCompression(GzipStore, 131070) // GZIP-store (dummy) compression
+	case LZ4:
+		return NewCompression(LZ4, 262140) // LZ4 compression (very fast)
+	case Snappy:
+		return NewCompression(Snappy, 262140) // Snappy compression (like LZ4, but slower and worse)
+	case GzipMin:
+		return NewCompression(GzipMin, 131070) // GZIP-min compression (fast)
+	case GzipDefault:
+		return NewCompression(GzipDefault, 131070) // GZIP-default compression (medium)
+	case XzInGzMin:
+		return NewCompression(XzInGzMin, 524288) // XZ-min compression (slow)
+	case XzInGz:
 		return NewCompression(XzInGz, 1048576) // XZ-default compression (very slow)
 	}
 	return nil, errors.New("Compression mode doesn't exist")
