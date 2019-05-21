@@ -75,12 +75,6 @@ can be opened by various archive programs, but they have some hidden metadata th
 While you may download and decompress these files at will, do **not** upload any compressed files to a wrapped remote
 through any other means than rclone. This will upload files that do not contain metadata and **will** cause unexpected behavior.
 
-#### Overhead
-This remote adds significant overhead in terms of the number of requests. If the remote
-you are wrapping does not support partial reads, this will **greatly** increase the amount
-of network bandwidth consumed, and may drive up network costs and slow down rclone. Please
-check whether your wrapped remote works with press before using it.
-
 #### Experimental
 This remote is currently **experimental**. Things may break and data may be lost. Anything you do with this remote is
 at your own risk. Please understand the risks associated with using experimental code and don't use this remote in

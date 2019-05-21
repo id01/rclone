@@ -1053,13 +1053,14 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	}
 	// Check if our compression state is equal to our compressibility
 	var newObject *Object
+	origName := o.Remote()
 	if (o.meta.CompressionMode != Uncompressed) != compressible {
 		// If not, remove and reupload object, update metadata
 		err = o.Object.Remove()
 		if err != nil {
 			return err
 		}
-		newObject, err = o.f.putWithCustomFunctions(in, src, options, o.f.Fs.Put, updateMeta, true)
+		newObject, err = o.f.putWithCustomFunctions(in, o.f.renameObjectInfo(src, origName), options, o.f.Fs.Put, updateMeta, true)
 		o.Object = newObject.Object
 	} else {
 		// If they're the same, just update the object and metadata
