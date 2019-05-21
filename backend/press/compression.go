@@ -32,14 +32,14 @@ import (
 // Compression modes
 const (
 	Uncompressed = -1
-	GzipStore = 0
-	GzipMin = 1
-	GzipDefault = 2
-	GzipMax = 3
-	LZ4 = 4
-	Snappy = 5
-	XzInGzMin = 6
-	XzInGz = 7
+	GzipStore    = 0
+	GzipMin      = 1
+	GzipDefault  = 2
+	GzipMax      = 3
+	LZ4          = 4
+	Snappy       = 5
+	XzInGzMin    = 6
+	XzInGz       = 7
 )
 
 // Errors

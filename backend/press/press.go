@@ -3,15 +3,15 @@ package press
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
+	"crypto/md5"
+	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"strings"
 	"time"
-	"encoding/hex"
-	"crypto/md5"
-	"bytes"
-	"encoding/gob"
-	"compress/gzip"
 
 	"github.com/gabriel-vasile/mimetype"
 
@@ -88,9 +88,6 @@ const maxChunkSize = 8388608    // at 256KB and 8 MB.
 
 const metaFileExt = ".meta"
 const uncompressedFileExt = ".bin"
-var (
-	ErrDecodingMetadata = errors.New("error decoding metadata")
-)
 
 // newCompressionForConfig constructs a Compression object for the given config name
 func newCompressionForConfig(opt *Options) (*Compression, error) {
@@ -185,20 +182,22 @@ func isMetadataFile(filename string) bool {
 // Generates the file name for a data file
 func (c *Compression) generateDataName(remote string, compressed bool) (newRemote string) {
 	if compressed {
-		return remote + c.GetFileExtension()
+		newRemote = remote + c.GetFileExtension()
 	} else {
-		return remote + uncompressedFileExt
+		newRemote = remote + uncompressedFileExt
 	}
+	return newRemote
 }
 
 // Generates the file name from a compression mode
 func generateDataNameFromCompressionMode(remote string, mode int) (newRemote string) {
 	if mode != Uncompressed {
 		c, _ := NewCompressionPresetNumber(mode)
-		return c.generateDataName(remote, true)
+		newRemote = c.generateDataName(remote, true)
 	} else {
-		return remote + uncompressedFileExt
+		newRemote = remote + uncompressedFileExt
 	}
+	return newRemote
 }
 
 // Options defines the configuration for this backend
@@ -245,12 +244,12 @@ func (f *Fs) addMeta(entries *fs.DirEntries, mo fs.Object) {
 	meta := readMetadata(mo)
 	origFileName, _, err := processFileName(mo.Remote())
 	if err != nil {
-		fmt.Sprintf("Not a metadata file: %v", err)
+		fs.Errorf(mo, "Not a metadata file: %v", err)
 		return
 	}
 	o, err := f.Fs.NewObject(generateDataNameFromCompressionMode(origFileName, meta.CompressionMode))
 	if err != nil {
-		fmt.Sprintf("Metadata corrupted: %v", err)
+		fs.Errorf(mo, "Metadata corrupted: %v", err)
 		return
 	}
 	*entries = append(*entries, f.newObject(o, mo, meta))
@@ -337,7 +336,7 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 	}
 	meta := readMetadata(mo)
 	if meta == nil {
-		return nil, ErrDecodingMetadata
+		return nil, errors.New("error decoding metadata")
 	}
 	// Create our Object
 	o, err := f.Fs.NewObject(generateDataNameFromCompressionMode(remote, meta.CompressionMode))
@@ -349,7 +348,10 @@ func (c *Compression) checkFileCompressibilityAndType(in io.Reader) (newReader i
 	// Unwrap accounting, get compressibility of file, rewind reader, then wrap accounting back on
 	in, wrap := accounting.UnWrap(in)
 	var b bytes.Buffer
-	io.CopyN(&b, in, c.HeuristicBytes)
+	_, err = io.CopyN(&b, in, c.HeuristicBytes)
+	if err != nil && err != io.EOF {
+		return nil, false, "", err
+	}
 	compressible, _, err = c.GetFileCompressionInfo(bytes.NewReader(b.Bytes()))
 	if err != nil {
 		return nil, false, "", err
@@ -360,15 +362,34 @@ func (c *Compression) checkFileCompressibilityAndType(in io.Reader) (newReader i
 	return in, compressible, mimeType, nil
 }
 
+// Verifies an object hash
+func (f *Fs) verifyObjectHash(o fs.Object, hasher *hash.MultiHasher, ht hash.Type) (err error) {
+	srcHash := hasher.Sums()[ht]
+	var dstHash string
+	dstHash, err = o.Hash(ht)
+	if err != nil {
+		return errors.Wrap(err, "failed to read destination hash")
+	}
+	if srcHash != "" && dstHash != "" && srcHash != dstHash {
+		// remove object
+		err = o.Remove()
+		if err != nil {
+			fs.Errorf(o, "Failed to remove corrupted object: %v", err)
+		}
+		return errors.Errorf("corrupted on transfer: %v compressed hashes differ %q vs %q", ht, srcHash, dstHash)
+	}
+	return nil
+}
+
 type putFn func(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error)
 
 type blockDataAndError struct {
-	err error
+	err       error
 	blockData []uint32
 }
 
 // Put a compressed version of a file. Returns a wrappable object and metadata.
-func (f *Fs) putCompress(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, put putFn, mimeType string) (fs.Object, *ObjectMetadata, error) {
+func (f *Fs) putCompress(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, put putFn, mimeType string, verifyCompressedObject bool) (fs.Object, *ObjectMetadata, error) {
 	// Unwrap reader accounting
 	in, wrap := accounting.UnWrap(in)
 
@@ -393,23 +414,22 @@ func (f *Fs) putCompress(in io.Reader, src fs.ObjectInfo, options []fs.OpenOptio
 	}()
 	wrappedIn = wrap(bufio.NewReaderSize(pipeReader, bufferSize)) // Bufio required for multithreading
 
-	// Find a hash the destination supports to compute a hash of
-	// the compressed data. Also intialize metadata hasher.
+	// If verifyCompressedObject is on, find a hash the destination supports to compute a hash of
+	// the compressed data.
 	ht := f.Fs.Hashes().GetOne()
 	var hasher *hash.MultiHasher
 	var err error
-	// unwrap the accounting again
-	wrappedIn, wrap = accounting.UnWrap(wrappedIn)
-	if ht != hash.None {
+	if ht != hash.None && verifyCompressedObject {
+		// unwrap the accounting again
+		wrappedIn, wrap = accounting.UnWrap(wrappedIn)
 		hasher, err = hash.NewMultiHasherTypes(hash.NewHashSet(ht))
 		if err != nil {
 			return nil, nil, err
 		}
-		// add the hasher
+		// add the hasher and re-wrap the accounting
 		wrappedIn = io.TeeReader(wrappedIn, hasher)
+		wrappedIn = wrap(wrappedIn)
 	}
-	// wrap the accounting back on
-	wrappedIn = wrap(wrappedIn)
 
 	// Transfer the data
 	o, err := put(wrappedIn, f.renameObjectInfo(src, f.c.generateDataName(src.Remote(), true)), options...)
@@ -439,23 +459,13 @@ func (f *Fs) putCompress(in io.Reader, src fs.ObjectInfo, options []fs.OpenOptio
 	// Generate metadata
 	blockData := result.blockData
 	_, _, decompressedSize := parseBlockData(blockData, f.c.BlockSize)
-	meta := generateMetadata(decompressedSize, f.c.CompressionMode, f.c.generateDataName(src.Remote(), true), blockData, metaHasher.Sum([]byte{}), mimeType)
+	meta := newMetadata(decompressedSize, f.c.CompressionMode, f.c.generateDataName(src.Remote(), true), blockData, metaHasher.Sum([]byte{}), mimeType)
 
 	// Check the hashes of the compressed data if we were comparing them
 	if ht != hash.None && hasher != nil {
-		srcHash := hasher.Sums()[ht]
-		var dstHash string
-		dstHash, err = o.Hash(ht)
+		err := f.verifyObjectHash(o, hasher, ht)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, "failed to read destination hash")
-		}
-		if srcHash != "" && dstHash != "" && srcHash != dstHash {
-			// remove object
-			err = o.Remove()
-			if err != nil {
-				fs.Errorf(o, "Failed to remove corrupted object: %v", err)
-			}
-			return nil, nil, errors.Errorf("corrupted on transfer: %v compressed hashes differ %q vs %q", ht, srcHash, dstHash)
+			return nil, nil, err
 		}
 	}
 
@@ -463,14 +473,30 @@ func (f *Fs) putCompress(in io.Reader, src fs.ObjectInfo, options []fs.OpenOptio
 }
 
 // Put an uncompressed version of a file. Returns a wrappable object and metadata.
-func (f *Fs) putUncompress(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, put putFn, mimeType string) (fs.Object, *ObjectMetadata, error) {
+func (f *Fs) putUncompress(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, put putFn, mimeType string, verifyCompressedObject bool) (fs.Object, *ObjectMetadata, error) {
 	// Unwrap the accounting, add our metadata hasher, then wrap it back on
 	in, wrap := accounting.UnWrap(in)
 	metaHasher := md5.New()
 	in = io.TeeReader(in, metaHasher)
-	in = wrap(in)
+	wrappedIn := wrap(in)
+	// If verifyCompressedObject is on, find a hash the destination supports to compute a hash of
+	// the compressed data.
+	ht := f.Fs.Hashes().GetOne()
+	var hasher *hash.MultiHasher
+	var err error
+	if ht != hash.None && verifyCompressedObject {
+		// unwrap the accounting again
+		wrappedIn, wrap = accounting.UnWrap(wrappedIn)
+		hasher, err = hash.NewMultiHasherTypes(hash.NewHashSet(ht))
+		if err != nil {
+			return nil, nil, err
+		}
+		// add the hasher and re-wrap the accounting
+		wrappedIn = io.TeeReader(wrappedIn, hasher)
+		wrappedIn = wrap(wrappedIn)
+	}
 	// Put the object
-	o, err := put(in, f.renameObjectInfo(src, f.c.generateDataName(src.Remote(), false)), options...)
+	o, err := put(wrappedIn, f.renameObjectInfo(src, f.c.generateDataName(src.Remote(), false)), options...)
 	if err != nil {
 		if o != nil {
 			removeErr := o.Remove()
@@ -480,12 +506,20 @@ func (f *Fs) putUncompress(in io.Reader, src fs.ObjectInfo, options []fs.OpenOpt
 		}
 		return nil, nil, err
 	}
+	// Check the hashes of the compressed data if we were comparing them
+	if ht != hash.None && hasher != nil {
+		err := f.verifyObjectHash(o, hasher, ht)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	// Return our object and metadata
-	return o, generateMetadata(o.Size(), Uncompressed, f.c.generateDataName(src.Remote(), false), []uint32{}, metaHasher.Sum([]byte{}), mimeType), nil
+	return o, newMetadata(o.Size(), Uncompressed, f.c.generateDataName(src.Remote(), false), []uint32{}, metaHasher.Sum([]byte{}), mimeType), nil
 }
 
 // This function will write a metadata struct to a metadata Object for an src. Returns a wrappable metadata object.
-func (f *Fs) putMetadata(meta *ObjectMetadata, src fs.ObjectInfo, options []fs.OpenOption, put putFn) (mo fs.Object, err error) {
+func (f *Fs) putMetadata(meta *ObjectMetadata, src fs.ObjectInfo, options []fs.OpenOption, put putFn, verifyCompressedObject bool) (mo fs.Object, err error) {
+	// Generate the metadata contents
 	var b bytes.Buffer
 	gzipWriter := gzip.NewWriter(&b)
 	metadataEncoder := gob.NewEncoder(gzipWriter)
@@ -497,7 +531,21 @@ func (f *Fs) putMetadata(meta *ObjectMetadata, src fs.ObjectInfo, options []fs.O
 	if err != nil {
 		return nil, err
 	}
-	mo, err = put(bytes.NewReader(b.Bytes()), f.renameObjectInfo(src, generateMetadataName(src.Remote())), options...)
+	var metaReader io.Reader
+	metaReader = bytes.NewReader(b.Bytes())
+	// If verifyCompressedObject is on, find a hash the destination supports to compute a hash of
+	// the compressed data.
+	ht := f.Fs.Hashes().GetOne()
+	var hasher *hash.MultiHasher
+	if ht != hash.None && verifyCompressedObject {
+		hasher, err = hash.NewMultiHasherTypes(hash.NewHashSet(ht))
+		if err != nil {
+			return nil, err
+		}
+		metaReader = io.TeeReader(metaReader, hasher)
+	}
+	// Put the data
+	mo, err = put(metaReader, f.renameObjectInfo(src, generateMetadataName(src.Remote())), options...)
 	if err != nil {
 		removeErr := mo.Remove()
 		if removeErr != nil {
@@ -505,12 +553,20 @@ func (f *Fs) putMetadata(meta *ObjectMetadata, src fs.ObjectInfo, options []fs.O
 		}
 		return nil, err
 	}
-	return mo, err
+	// Check the hashes of the compressed data if we were comparing them
+	if ht != hash.None && hasher != nil {
+		err := f.verifyObjectHash(mo, hasher, ht)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return mo, nil
 }
 
 // This function will put both the data and metadata for an Object.
 // putData is the function used for data, while putMeta is the function used for metadata.
-func (f *Fs) putWithCustomFunctions(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, putData putFn, putMeta putFn) (*Object, error) {
+func (f *Fs) putWithCustomFunctions(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, putData putFn, putMeta putFn, verifyCompressedObject bool) (*Object, error) {
 	// Check compressibility of file
 	in, compressible, mimeType, err := f.c.checkFileCompressibilityAndType(in)
 	if err != nil {
@@ -520,20 +576,20 @@ func (f *Fs) putWithCustomFunctions(in io.Reader, src fs.ObjectInfo, options []f
 	var dataObject fs.Object
 	var meta *ObjectMetadata
 	if compressible {
-		dataObject, meta, err = f.putCompress(in, src, options, putData, mimeType)
+		dataObject, meta, err = f.putCompress(in, src, options, putData, mimeType, verifyCompressedObject)
 	} else {
-		dataObject, meta, err = f.putUncompress(in, src, options, putData, mimeType)
+		dataObject, meta, err = f.putUncompress(in, src, options, putData, mimeType, verifyCompressedObject)
 	}
 	if err != nil {
 		return nil, err
 	}
-	mo, err := f.putMetadata(meta, src, options, putMeta)
+	mo, err := f.putMetadata(meta, src, options, putMeta, verifyCompressedObject)
 	return f.newObject(dataObject, mo, meta), err
 }
 
-// This function will put both the data and metadata for an Object, using the default f.Fs.Put for metadata.
+// This function will put both the data and metadata for an Object, using the default f.Fs.Put for metadata and checking file hashes.
 func (f *Fs) put(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, put putFn) (*Object, error) {
-	return f.putWithCustomFunctions(in, src, options, put, f.Fs.Put)
+	return f.putWithCustomFunctions(in, src, options, put, f.Fs.Put, true)
 }
 
 // Put in to the remote path with the modTime given of the given size
@@ -548,6 +604,19 @@ func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.
 // PutStream uploads to the remote path with the modTime given of indeterminate size
 func (f *Fs) PutStream(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	return f.put(in, src, options, f.Fs.Features().PutStream)
+}
+
+// PutUnchecked uploads the object
+//
+// This will create a duplicate if we upload a new file without
+// checking to see if there is one already - use Put() for that.
+func (f *Fs) PutUnchecked(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	// If PutUnchecked is supported, do it.
+	do := f.Fs.Features().PutUnchecked
+	if do == nil {
+		return nil, errors.New("can't PutUnchecked")
+	}
+	return f.putWithCustomFunctions(in, src, options, do, do, false)
 }
 
 // Hashes returns the supported hash sets.
@@ -609,9 +678,6 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	}
 	// Copy over data
 	newFilename = generateDataNameFromCompressionMode(remote, o.meta.CompressionMode)
-	if err != nil {
-		return nil, err
-	}
 	oResult, err := do(o.Object, newFilename)
 	if err != nil {
 		return nil, err
@@ -645,9 +711,6 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 	}
 	// Move data
 	newFilename = generateDataNameFromCompressionMode(remote, o.meta.CompressionMode)
-	if err != nil {
-		return nil, err
-	}
 	oResult, err := do(o.Object, newFilename)
 	if err != nil {
 		return nil, err
@@ -674,45 +737,6 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) error {
 		return fs.ErrorCantDirMove
 	}
 	return do(srcFs.Fs, srcRemote, dstRemote)
-}
-
-// PutUnchecked uploads the object
-//
-// This will create a duplicate if we upload a new file without
-// checking to see if there is one already - use Put() for that.
-func (f *Fs) PutUnchecked(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	return nil, errors.New("Not yet implemented")
-/*	// Unwrap reader accounting
-	in, wrap := accounting.UnWrap(in)
-
-	// Check if putUnchecked is supported
-	do := f.Fs.Features().PutUnchecked
-	if do == nil {
-		return nil, errors.New("can't PutUnchecked")
-	}
-
-	// Unwrap reader accounting and decompress file
-	var wrappedIn io.Reader
-	pipeReader, pipeWriter := io.Pipe()
-	compressionError := make(chan error)
-	go func() {
-		err := f.c.CompressFileAppendingBlockData(in, pipeWriter)
-		compressionError <- err
-	}()
-	wrappedIn = wrap(bufio.NewReaderSize(pipeReader, bufferSize)) // Required for multithreading
-
-	// Actually put the file
-	o, err := do(wrappedIn, f.newObjectInfo(src))
-	if err != nil {
-		return nil, err
-	}
-
-	// Check for errors
-	err = <-compressionError
-	if err != nil {
-		return nil, err
-	}
-	return f.newObject(o), nil*/
 }
 
 // CleanUp the trash in the Fs
@@ -821,23 +845,23 @@ func (f *Fs) PublicLink(remote string) (string, error) {
 
 // ObjectMetadata describes the metadata for an Object.
 type ObjectMetadata struct {
-	Size int64 // Uncompressed size of the file.
-	CompressionMode int // Compression mode of the file.
-	BlockData []uint32 // Block indexing data for the file.
-	Hash []byte // MD5 hash of the file.
-	MimeType string // Mime type of the file
+	Size            int64    // Uncompressed size of the file.
+	CompressionMode int      // Compression mode of the file.
+	BlockData       []uint32 // Block indexing data for the file.
+	Hash            []byte   // MD5 hash of the file.
+	MimeType        string   // Mime type of the file
 }
 
 // Object with external metadata
 type Object struct {
-	fs.Object // Wraps around data object for this object
-	f *Fs // Filesystem object is in
-	mo fs.Object // Metadata object for this object
-	meta *ObjectMetadata // Metadata struct for this object
+	fs.Object                 // Wraps around data object for this object
+	f         *Fs             // Filesystem object is in
+	mo        fs.Object       // Metadata object for this object
+	meta      *ObjectMetadata // Metadata struct for this object
 }
 
 // This function generates a metadata object
-func generateMetadata(size int64, compressionMode int, filename string, blockData []uint32, hash []byte, mimeType string) *ObjectMetadata {
+func newMetadata(size int64, compressionMode int, filename string, blockData []uint32, hash []byte, mimeType string) *ObjectMetadata {
 	meta := new(ObjectMetadata)
 	meta.Size = size
 	meta.CompressionMode = compressionMode
@@ -859,7 +883,10 @@ func readMetadata(mo fs.Object) (meta *ObjectMetadata) {
 		return nil
 	}
 	metadataDecoder := gob.NewDecoder(gzipReader)
-	metadataDecoder.Decode(meta)
+	err = metadataDecoder.Decode(meta)
+	if err != nil {
+		return nil
+	}
 	err = rc.Close()
 	if err != nil {
 		return nil
@@ -876,8 +903,8 @@ func (f *Fs) newObject(o fs.Object, mo fs.Object, meta *ObjectMetadata) *Object 
 	return &Object{
 		Object: o,
 		f:      f,
-		mo:    mo,
-		meta: meta,
+		mo:     mo,
+		meta:   meta,
 	}
 }
 
@@ -896,8 +923,12 @@ func (o *Object) String() string {
 
 // Remove removes this object
 func (o *Object) Remove() error {
-	o.mo.Remove()
-	return o.Object.Remove()
+	err := o.mo.Remove()
+	objErr := o.Object.Remove()
+	if err != nil {
+		return err
+	}
+	return objErr
 }
 
 // Remote returns the remote path
@@ -918,11 +949,10 @@ func (o *Object) Size() int64 {
 // Hash returns the selected checksum of the file
 // If no checksum is available it returns ""
 func (o *Object) Hash(ht hash.Type) (string, error) {
-	if ht & hash.MD5 == 0 {
+	if ht&hash.MD5 == 0 {
 		return "", hash.ErrUnsupported
-	} else {
-		return hex.EncodeToString(o.meta.Hash), nil
 	}
+	return hex.EncodeToString(o.meta.Hash), nil
 }
 
 // MimeType returns the MIME type of the file
@@ -1025,12 +1055,15 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	var newObject *Object
 	if (o.meta.CompressionMode != Uncompressed) != compressible {
 		// If not, remove and reupload object, update metadata
-		o.Object.Remove()
-		newObject, err = o.f.putWithCustomFunctions(in, src, options, o.f.Fs.Put, updateMeta)
+		err = o.Object.Remove()
+		if err != nil {
+			return err
+		}
+		newObject, err = o.f.putWithCustomFunctions(in, src, options, o.f.Fs.Put, updateMeta, true)
 		o.Object = newObject.Object
 	} else {
 		// If they're the same, just update the object and metadata
-		newObject, err = o.f.putWithCustomFunctions(in, src, options, update, updateMeta)
+		newObject, err = o.f.putWithCustomFunctions(in, src, options, update, updateMeta, true)
 	}
 	// Update object metadata and return
 	o.meta = newObject.meta
@@ -1065,17 +1098,20 @@ func (o *Object) GetTier() string {
 	return do.GetTier()
 }
 
-// Renames an ObjectInfo
+// RenamedObjectInfo is the renamed representation of an ObjectInfo
 type RenamedObjectInfo struct {
 	fs.ObjectInfo
 	remote string
 }
+
 func (f *Fs) renameObjectInfo(src fs.ObjectInfo, newRemote string) *RenamedObjectInfo {
 	return &RenamedObjectInfo{
 		ObjectInfo: src,
-		remote: newRemote,
+		remote:     newRemote,
 	}
 }
+
+// Remote gets the remote of the RenamedObjectInfo
 func (o *RenamedObjectInfo) Remote() string {
 	return o.remote
 }
@@ -1083,7 +1119,7 @@ func (o *RenamedObjectInfo) Remote() string {
 // ObjectInfo describes a wrapped fs.ObjectInfo for being the source
 type ObjectInfo struct {
 	fs.ObjectInfo
-	f *Fs
+	f    *Fs
 	meta *ObjectMetadata
 }
 
@@ -1119,11 +1155,10 @@ func (o *ObjectInfo) Size() int64 {
 // Hash returns the selected checksum of the file
 // If no checksum is available it returns ""
 func (o *ObjectInfo) Hash(ht hash.Type) (string, error) {
-	if ht & hash.MD5 == 0 {
+	if ht&hash.MD5 == 0 {
 		return "", hash.ErrUnsupported
-	} else {
-		return hex.EncodeToString(o.meta.Hash), nil
 	}
+	return hex.EncodeToString(o.meta.Hash), nil
 }
 
 // Check the interfaces are satisfied
