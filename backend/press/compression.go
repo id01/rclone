@@ -555,6 +555,38 @@ type Decompressor struct {
 const lengthOffsetFromEnd = gzipDataAndFooterSize + 4          // How far the 4-byte length of gzipped data is from the end
 const trailingBytes = lengthOffsetFromEnd + 2 + gzipHeaderSize // This is the total size of the last gzip file in the stream, which is not included in the length of gzipped data
 
+// Parses block data. Returns the number of blocks, the block start locations for each block, and the decompressed size of the entire file.
+func parseBlockData(blockData []uint32, BlockSize uint32) (numBlocks uint32, blockStarts []int64, decompressedSize int64) {
+	// Parse the block data
+	blockDataLen := len(blockData)
+	numBlocks = uint32(blockDataLen - 1)
+	if DEBUG {
+		log.Printf("%v\n", blockData)
+		log.Printf("metadata len, numblocks = %d, %d", blockDataLen, numBlocks)
+	}
+	blockStarts = make([]int64, numBlocks+1) // Starts with start of first block (and end of header), ends with end of last block
+	currentBlockPosition := int64(0)
+	for i := uint32(0); i < numBlocks; i++ { // Loop through block data, getting starts of blocks.
+		currentBlockSize := blockData[i]
+		currentBlockPosition += int64(currentBlockSize)
+		blockStarts[i] = currentBlockPosition
+	}
+	blockStarts[numBlocks] = currentBlockPosition // End of last block
+
+	//log.Printf("Block Starts: %v\n", d.blockStarts)
+
+	numBlocks-- // Subtract 1 from number of blocks because our header technically isn't a block
+
+	// Get uncompressed size of last block and derive uncompressed size of file
+	lastBlockRawSize := blockData[blockDataLen-1]
+	decompressedSize = int64(numBlocks-1)*int64(BlockSize) + int64(lastBlockRawSize)
+	if DEBUG {
+		log.Printf("Decompressed size = %d", decompressedSize)
+	}
+
+	return numBlocks, blockStarts, decompressedSize
+}
+
 // Initializes decompressor with the block data specified.
 func (d *Decompressor) initWithBlockData(c *Compression, in io.ReadSeeker, size int64, blockData []uint32) (err error) {
 	// Copy over compression object
@@ -564,31 +596,7 @@ func (d *Decompressor) initWithBlockData(c *Compression, in io.ReadSeeker, size 
 	d.cursorPos = new(int64)
 
 	// Parse the block data
-	blockDataLen := len(blockData)
-	d.numBlocks = uint32(blockDataLen - 1)
-	if DEBUG {
-		log.Printf("%v\n", blockData)
-		log.Printf("metadata len, numblocks = %d, %d", blockDataLen, d.numBlocks)
-	}
-	d.blockStarts = make([]int64, d.numBlocks+1) // Starts with start of first block (and end of header), ends with end of last block
-	currentBlockPosition := int64(0)
-	for i := uint32(0); i < d.numBlocks; i++ { // Loop through block data, getting starts of blocks.
-		currentBlockSize := blockData[i]
-		currentBlockPosition += int64(currentBlockSize)
-		d.blockStarts[i] = currentBlockPosition
-	}
-	d.blockStarts[d.numBlocks] = currentBlockPosition // End of last block
-
-	//log.Printf("Block Starts: %v\n", d.blockStarts)
-
-	d.numBlocks-- // Subtract 1 from number of blocks because our header technically isn't a block
-
-	// Get uncompressed size of last block and derive uncompressed size of file
-	lastBlockRawSize := blockData[blockDataLen-1]
-	d.decompressedSize = int64(d.numBlocks-1)*int64(d.c.BlockSize) + int64(lastBlockRawSize)
-	if DEBUG {
-		log.Printf("Decompressed size = %d", d.decompressedSize)
-	}
+	d.numBlocks, d.blockStarts, d.decompressedSize = parseBlockData(blockData, d.c.BlockSize)
 
 	// Initialize cursor position value and copy over reader
 	*d.cursorPos = 0

@@ -16,6 +16,7 @@ require (
 	github.com/coreos/bbolt v1.3.2
 	github.com/djherbis/times v1.2.0
 	github.com/dropbox/dropbox-sdk-go-unofficial v5.4.0+incompatible
+	github.com/gabriel-vasile/mimetype v0.3.8
 	github.com/goftp/file-driver v0.0.0-20180502053751-5d604a0fc0c9 // indirect
 	github.com/goftp/server v0.0.0-20190304020633-eabccc535b5a
 	github.com/golang/protobuf v1.3.1 // indirect
