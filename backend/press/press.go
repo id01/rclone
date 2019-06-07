@@ -11,7 +11,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-//	"io/ioutil"
+	"io/ioutil"
 	"strings"
 	"time"
 
@@ -20,7 +20,7 @@ import (
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/accounting"
 	"github.com/ncw/rclone/fs/chunkedreader"
-//	"github.com/ncw/rclone/fs/operations" // Used for Rcat
+	"github.com/ncw/rclone/fs/operations" // Used for Rcat
 	"github.com/ncw/rclone/fs/config/configmap"
 	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/fspath"
@@ -500,8 +500,8 @@ func (f *Fs) putCompress(in io.Reader, src fs.ObjectInfo, options []fs.OpenOptio
 	}
 
 	// Transfer the data
-	o, err := put(wrappedIn, f.renameObjectInfo(src, f.c.generateDataName(src.Remote(), src.Size(), true), -1), options...)
-//	o, err := operations.Rcat(f, f.c.generateDataName(src.Remote(), src.Size(), true), ioutil.NopCloser(wrappedIn), src.ModTime())
+//	o, err := put(wrappedIn, f.renameObjectInfo(src, f.c.generateDataName(src.Remote(), src.Size(), true), -1), options...)
+	o, err := operations.Rcat(f.Fs, f.c.generateDataName(src.Remote(), src.Size(), true), ioutil.NopCloser(wrappedIn), src.ModTime())
 	if err != nil {
 		if o != nil {
 			removeErr := o.Remove()
