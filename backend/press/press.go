@@ -11,7 +11,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
+//	"io/ioutil"
 	"strings"
 	"time"
 
@@ -20,7 +20,7 @@ import (
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/accounting"
 	"github.com/ncw/rclone/fs/chunkedreader"
-	"github.com/ncw/rclone/fs/operations" // Used for Rcat
+//	"github.com/ncw/rclone/fs/operations" // Used for Rcat
 	"github.com/ncw/rclone/fs/config/configmap"
 	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/fspath"
@@ -195,8 +195,11 @@ func processFileName(compressedFileName string) (origFileName string, extension 
 		err = nil
 	} else {
 		sizeLoc := len(nameWithSize)-16
-		name = compressedFileName[:sizeLoc]
-		size, err = hexToInt64(compressedFileName[sizeLoc:])
+		name = nameWithSize[:sizeLoc]
+		size, err = hexToInt64(nameWithSize[sizeLoc:])
+		if err != nil {
+			return "", "", 0, errors.New("Could not decode size")
+		}
 	}
 	// Return everything
 	return name, extension, size, nil
@@ -288,7 +291,7 @@ func (f *Fs) String() string {
 }
 
 // Get an object from a metadata file
-func (f *Fs) addMeta(entries *fs.DirEntries, mo fs.Object) {
+/*func (f *Fs) addMeta(entries *fs.DirEntries, mo fs.Object) {
 	meta := readMetadata(mo)
 	origFileName, err := processMetadataName(mo.Remote())
 	if err != nil {
@@ -301,19 +304,20 @@ func (f *Fs) addMeta(entries *fs.DirEntries, mo fs.Object) {
 		return
 	}
 	*entries = append(*entries, f.newObject(o, mo, meta))
-}
+}*/
 
-// Get an ObjectInfo from a data DirEntry
-func (f *Fs) addDataInfo(entries *fs.DirEntries, o fs.ObjectInfo) {
-//	_, ext, size, err := processFileName(o.Remote())
-//	if err != nil {
-//		fs.Errorf(o, "Error on parsing file name: %v", err)
-//		return
-//	}
-//	if size == -2 { // File is uncompressed
-//		size = o.Size()
-//	} // We're doing the parsing in ObjectInfo now
-	*entries = append(*entries, f.newObjectInfo(o))
+// Get an Object from a data DirEntry
+func (f *Fs) addData(entries *fs.DirEntries, o fs.Object) {
+	origFileName, _, size, err := processFileName(o.Remote())
+	if err != nil {
+		fs.Errorf(o, "Error on parsing file name: %v", err)
+		return
+	}
+	if size == -2 { // File is uncompressed
+		size = o.Size()
+	}
+	metaName := generateMetadataName(origFileName)
+	*entries = append(*entries, f.newObjectSizeAndNameOnly(o, metaName, size))
 }
 
 // Directory names are unchanged. Just append.
@@ -336,7 +340,7 @@ func (f *Fs) processEntries(entries fs.DirEntries) (newEntries fs.DirEntries, er
 //				f.addMeta(&newEntries, x) // Only care about metadata files; non-metadata files are redundant.
 //			}
 			if !isMetadataFile(x.Remote()) {
-				f.addDataInfo(&newEntries, x) // Only care about data files for now; metadata files are redundant.
+				f.addData(&newEntries, x) // Only care about data files for now; metadata files are redundant.
 			}
 		case fs.Directory:
 			f.addDir(&newEntries, x)
@@ -496,8 +500,8 @@ func (f *Fs) putCompress(in io.Reader, src fs.ObjectInfo, options []fs.OpenOptio
 	}
 
 	// Transfer the data
-//	o, err := put(wrappedIn, f.renameObjectInfo(src, f.c.generateDataName(src.Remote(), src.Size(), true)), options...)
-	o, err := operations.Rcat(f, f.c.generateDataName(src.Remote(), src.Size(), true), ioutil.NopCloser(wrappedIn), src.ModTime())
+	o, err := put(wrappedIn, f.renameObjectInfo(src, f.c.generateDataName(src.Remote(), src.Size(), true), -1), options...)
+//	o, err := operations.Rcat(f, f.c.generateDataName(src.Remote(), src.Size(), true), ioutil.NopCloser(wrappedIn), src.ModTime())
 	if err != nil {
 		if o != nil {
 			removeErr := o.Remove()
@@ -737,6 +741,10 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 		return nil, fs.ErrorCantCopy
 	}
 	// Copy over metadata
+	err := o.loadMetadataObjectIfNotLoaded()
+	if err != nil {
+		return nil, err
+	}
 	newFilename := generateMetadataName(remote)
 	moResult, err := do(o.mo, newFilename)
 	if err != nil {
@@ -770,6 +778,10 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 		return nil, fs.ErrorCantMove
 	}
 	// Move metadata
+	err := o.loadMetadataObjectIfNotLoaded()
+	if err != nil {
+		return nil, err
+	}
 	newFilename := generateMetadataName(remote)
 	moResult, err := do(o.mo, newFilename)
 	if err != nil {
@@ -923,7 +935,9 @@ type Object struct {
 	fs.Object                 // Wraps around data object for this object
 	f         *Fs             // Filesystem object is in
 	mo        fs.Object       // Metadata object for this object
-	meta      *ObjectMetadata // Metadata struct for this object
+	moName    string	  // Metadata file name for this object
+	size      int64		  // Size of this object
+	meta      *ObjectMetadata // Metadata struct for this object (nil if not loaded)
 }
 
 // This function generates a metadata object
@@ -973,8 +987,42 @@ func (f *Fs) newObject(o fs.Object, mo fs.Object, meta *ObjectMetadata) *Object 
 		Object: o,
 		f:      f,
 		mo:     mo,
+		moName: mo.Remote(),
+		size:   meta.Size,
 		meta:   meta,
 	}
+}
+
+// This initializes the variables of a press Object with only the size. The metadata will be loaded later on demand.
+func (f *Fs) newObjectSizeAndNameOnly(o fs.Object, moName string, size int64) *Object {
+	return &Object{
+		Object: o,
+		f:      f,
+		mo:     nil,
+		moName: moName,
+		size:   size,
+		meta:   nil,
+	}
+}
+
+// This loads the metadata of a press Object if it's not loaded yet
+func (o *Object) loadMetadataIfNotLoaded() (err error) {
+	err = o.loadMetadataObjectIfNotLoaded()
+	if err != nil {
+		return err
+	}
+	if o.meta == nil {
+		o.meta = readMetadata(o.mo)
+	}
+	return err
+}
+
+// This loads the metadata object of a press Object if it's not loaded yet
+func (o *Object) loadMetadataObjectIfNotLoaded() (err error) {
+	if o.mo == nil {
+		o.mo, err = o.f.Fs.NewObject(o.moName)
+	}
+	return err
 }
 
 // Fs returns read only access to the Fs that this object is part of
@@ -992,7 +1040,11 @@ func (o *Object) String() string {
 
 // Remove removes this object
 func (o *Object) Remove() error {
-	err := o.mo.Remove()
+	err := o.loadMetadataObjectIfNotLoaded()
+	if err != nil {
+		return err
+	}
+	err = o.mo.Remove()
 	objErr := o.Object.Remove()
 	if err != nil {
 		return err
@@ -1012,12 +1064,19 @@ func (o *Object) Remote() string {
 
 // Size returns the size of the file
 func (o *Object) Size() int64 {
+	if o.meta == nil {
+		return o.size
+	}
 	return o.meta.Size
 }
 
 // Hash returns the selected checksum of the file
 // If no checksum is available it returns ""
 func (o *Object) Hash(ht hash.Type) (string, error) {
+	err := o.loadMetadataIfNotLoaded()
+	if err != nil {
+		return "", err
+	}
 	if ht&hash.MD5 == 0 {
 		return "", hash.ErrUnsupported
 	}
@@ -1026,6 +1085,10 @@ func (o *Object) Hash(ht hash.Type) (string, error) {
 
 // MimeType returns the MIME type of the file
 func (o *Object) MimeType() string {
+	err := o.loadMetadataIfNotLoaded()
+	if err != nil {
+		return "error/error"
+	}
 	return o.meta.MimeType
 }
 
@@ -1059,6 +1122,10 @@ func (w *ReadCloserWrapper) Close() error {
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser. Note that this call requires quite a bit of overhead.
 func (o *Object) Open(options ...fs.OpenOption) (rc io.ReadCloser, err error) {
+	err = o.loadMetadataIfNotLoaded()
+	if err != nil {
+		return nil, err
+	}
 	// If we're uncompressed, just pass this to the underlying object
 	if o.meta.CompressionMode == Uncompressed {
 		return o.Object.Open(options...)
@@ -1107,6 +1174,10 @@ func (o *Object) Open(options ...fs.OpenOption) (rc io.ReadCloser, err error) {
 
 // Update in to the object with the modTime given of the given size
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	err = o.loadMetadataIfNotLoaded() // Loads metadata object too
+	if err != nil {
+		return err
+	}
 	// Function that updates object
 	update := func(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 		return o.Object, o.Object.Update(in, src, options...)
@@ -1131,9 +1202,14 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		}
 		newObject, err = o.f.putWithCustomFunctions(in, o.f.renameObjectInfo(src, origName, src.Size()), options, o.f.Fs.Put, updateMeta, true)
 		o.Object = newObject.Object
+		o.meta = newObject.meta
+		o.size = newObject.size
 	} else {
 		// If we are, just update the object and metadata
 		newObject, err = o.f.putWithCustomFunctions(in, src, options, update, updateMeta, true)
+		o.Object = newObject.Object
+		o.meta = newObject.meta
+		o.size = newObject.size
 	}
 	// Update object metadata and return
 	o.meta = newObject.meta
