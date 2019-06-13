@@ -132,7 +132,7 @@ func (c *Compression) GetFileExtension() string {
 	case GzipStore, GzipMin, GzipDefault, GzipMax:
 		return ".gz"
 	case XZMin, XZDefault:
-		return ".xzgz"
+		return ".xz"
 	case LZ4:
 		return ".lz4"
 	case Snappy:
