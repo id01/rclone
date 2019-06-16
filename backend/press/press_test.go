@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	_ "github.com/ncw/rclone/backend/local"
+	_ "github.com/ncw/rclone/backend/b2"
+	_ "github.com/ncw/rclone/backend/dropbox"
 	"github.com/ncw/rclone/fstest"
 	"github.com/ncw/rclone/fstest/fstests"
 )

@@ -12,6 +12,9 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+//	"path"
+//	"reflect"
+//	"sort"
 	"strings"
 	"time"
 
@@ -289,7 +292,39 @@ func (f *Fs) String() string {
 	*entries = append(*entries, f.newObject(o, mo, meta))
 }*/
 
+// DirEntries that also compares ModTime
+type DirEntries struct {
+	fs.DirEntries
+}
+
+// Less is part of sort.Interface.
+func (ds DirEntries) Less(i, j int) bool {
+	return CompareDirEntries(ds.DirEntries[i], ds.DirEntries[j]) < 0
+}
+
+// CompareDirEntries returns 1 if a > b, 0 if a == b and -1 if a < b
+// If two dir entries have the same name, compare their types (directories are before objects), then ModTime.
+func CompareDirEntries(a, b fs.DirEntry) int {
+	// Compare name and type
+	nameAndTypeResult := fs.CompareDirEntries(a,b)
+	if nameAndTypeResult != 0 {
+		return nameAndTypeResult
+	}
+
+	// same name and type, compare ModTime
+	mtA := a.ModTime()
+	mtB := b.ModTime()
+	if mtA.After(mtB) {
+		return 1
+	} else if mtB.After(mtA) {
+		return -1
+	}
+
+	return 0
+}
+
 // Get an Object from a data DirEntry
+//func (f *Fs) addData(entries *fs.DirEntries, o fs.Object) {
 func (f *Fs) addData(entries *fs.DirEntries, o fs.Object) {
 	origFileName, _, size, err := processFileName(o.Remote())
 	if err != nil {
@@ -304,6 +339,7 @@ func (f *Fs) addData(entries *fs.DirEntries, o fs.Object) {
 }
 
 // Directory names are unchanged. Just append.
+//func (f *Fs) addDir(entries *fs.DirEntries, dir fs.Directory) {
 func (f *Fs) addDir(entries *fs.DirEntries, dir fs.Directory) {
 	*entries = append(*entries, f.newDir(dir))
 }
@@ -315,13 +351,27 @@ func (f *Fs) newDir(dir fs.Directory) fs.Directory {
 
 // Processes file entries by removing compression data.
 func (f *Fs) processEntries(entries fs.DirEntries) (newEntries fs.DirEntries, err error) {
+	// Process entries from entries to processedEntries
+//	var processedEntries DirEntries
 	newEntries = entries[:0] // in place filter
-	for _, entry := range entries {
+/*	for _, entry := range entries {
 		switch x := entry.(type) {
 		case fs.Object:
 			//			if isMetadataFile(x.Remote()) {
 			//				f.addMeta(&newEntries, x) // Only care about metadata files; non-metadata files are redundant.
 			//			}
+			if !isMetadataFile(x.Remote()) {
+				f.addData(&processedEntries.DirEntries, x) // Only care about data files for now; metadata files are redundant.
+			}
+		case fs.Directory:
+			f.addDir(&processedEntries.DirEntries, x)
+		default:
+			return nil, errors.Errorf("Unknown object type %T", entry)
+		}
+	}*/
+	for _, entry := range entries {
+		switch x := entry.(type) {
+		case fs.Object:
 			if !isMetadataFile(x.Remote()) {
 				f.addData(&newEntries, x) // Only care about data files for now; metadata files are redundant.
 			}
@@ -331,6 +381,38 @@ func (f *Fs) processEntries(entries fs.DirEntries) (newEntries fs.DirEntries, er
 			return nil, errors.Errorf("Unknown object type %T", entry)
 		}
 	}
+	// Remove duplicate objects from processedEntries into newEntries (which is an in-place filter of entries)
+	// Also removes duplicate objects from the remote
+/*	sort.Sort(processedEntries)
+	var previousObject *Object
+	newEntries = entries[:0] // in place filter
+	for _, entry := range processedEntries.DirEntries {
+		switch x := entry.(type) {
+			case fs.Object:
+				obj, ok := x.(*Object)
+				if ok {
+					if previousObject != nil {
+						if obj.Remote() == previousObject.Remote() {
+//							previousObject.Object.Remove()
+						} else {
+							newEntries = append(newEntries, previousObject)
+						}
+					}
+					previousObject = obj
+				} else {
+					errors.Errorf("Unsupported object: %v", x)
+				}
+			case fs.Directory:
+				newEntries = append(newEntries, x)
+		}
+	}
+	if previousObject != nil {
+		newEntries = append(newEntries, previousObject)
+	}
+	fmt.Println(processedEntries)
+	fmt.Println(newEntries)
+	return newEntries, nil*/
+//	return processedEntries.DirEntries, nil
 	return newEntries, nil
 }
 
@@ -349,7 +431,8 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return f.processEntries(entries)
+	entries, err = f.processEntries(entries)
+	return entries, err
 }
 
 // ListR lists the objects and directories of the Fs starting
@@ -378,8 +461,8 @@ func (f *Fs) ListR(dir string, callback fs.ListRCallback) (err error) {
 	})
 }
 
-// NewObject finds the Object at remote.
-func (f *Fs) NewObject(remote string) (fs.Object, error) {
+// NewObject finds the press.Object at remote.
+func (f *Fs) newPressObject(remote string) (*Object, error) {
 	// Read metadata from metadata object
 	mo, err := f.Fs.NewObject(generateMetadataName(remote))
 	if err != nil {
@@ -392,6 +475,16 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 	// Create our Object
 	o, err := f.Fs.NewObject(generateDataNameFromCompressionMode(remote, meta.Size, meta.CompressionMode))
 	return f.newObject(o, mo, meta), err
+}
+
+// NewObject finds the fs.Object at remote.
+func (f *Fs) NewObject(remote string) (fs.Object, error) {
+	o, err := f.newPressObject(remote)
+	if o == nil || err != nil { // Note: This must be done because a pointer nil is different than an interface nil.
+		return nil, err
+	} else {
+		return o, nil
+	}
 }
 
 // Checks the compressibility and mime type of a file. Returns a rewinded reader, whether the file is compressible, and an error code.
@@ -606,7 +699,7 @@ func (f *Fs) putMetadata(meta *ObjectMetadata, src fs.ObjectInfo, options []fs.O
 		}
 		return nil, err
 	}
-	// Check the hashes of the compressed data if we were comparing them
+	// Check the hash of the uploaded metadata object
 	if ht != hash.None && hasher != nil {
 		err := f.verifyObjectHash(mo, hasher, ht)
 		if err != nil {
@@ -637,12 +730,19 @@ func (f *Fs) putWithCustomFunctions(in io.Reader, src fs.ObjectInfo, options []f
 		return nil, err
 	}
 	mo, err := f.putMetadata(meta, src, options, putMeta, verifyCompressedObject)
+	if err != nil {
+		removeErr := dataObject.Remove() // On a metadata upload error, remove the data object before returning an error.
+		if removeErr != nil {
+			fs.Errorf(dataObject, "Error on removing data object: %v", removeErr)
+		}
+		return nil, err
+	}
 	return f.newObject(dataObject, mo, meta), err
 }
 
 // This function will put both the data and metadata for an Object, using the default f.Fs.Put for metadata and checking file hashes.
 func (f *Fs) put(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, put putFn) (*Object, error) {
-	return f.putWithCustomFunctions(in, src, options, put, f.Fs.Put, true)
+	return f.putWithCustomFunctions(in, src, options, put, f.Fs.Put, true) // Nil as metadata put function uses Rcat
 }
 
 // Put in to the remote path with the modTime given of the given size
@@ -651,12 +751,29 @@ func (f *Fs) put(in io.Reader, src fs.ObjectInfo, options []fs.OpenOption, put p
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	return f.put(in, src, options, f.Fs.Put)
+	// Check if object is already there
+	obj, err := f.NewObject(src.Remote())
+	if err != nil { // If it isn't, put the object
+		return f.put(in, src, options, f.Fs.Put)
+	}
+	err = obj.Update(in, src, options...)
+	return obj, err
 }
 
 // PutStream uploads to the remote path with the modTime given of indeterminate size
 func (f *Fs) PutStream(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	return f.put(in, src, options, f.Fs.Features().PutStream)
+	// Check if object is already there
+	obj, err := f.NewObject(src.Remote())
+	if err != nil { // If it isn't, put the object
+		obj, err = f.put(in, src, options, f.Fs.Features().PutStream)
+	} else { // Else, update the object
+		err = obj.Update(in, src, options...)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return f.Move(obj, obj.Remote())
+//	return f.put(in, src, options, f.Fs.Features().PutStream)
 }
 
 // PutUnchecked uploads the object
@@ -715,6 +832,8 @@ func (f *Fs) Purge() error {
 //
 // If it isn't possible then return fs.ErrorCantCopy
 func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
+	fmt.Printf("%s %s -> %s %s\n", src.Fs(), src, f.Fs, remote)
+	// Get copy feature and object
 	do := f.Fs.Features().Copy
 	if do == nil {
 		return nil, fs.ErrorCantCopy
@@ -723,21 +842,46 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	if !ok {
 		return nil, fs.ErrorCantCopy
 	}
-	// Copy over metadata
-	err := o.loadMetadataObjectIfNotLoaded()
+	// Get old file at destination remote if it exists and the destination is not the source
+	var oldDst *Object
+	var getOldDstErr error
+	remotesAreEqual := src.Remote() != remote || src.Fs().String() != f.String()
+	if remotesAreEqual {
+		oldDst, getOldDstErr = f.newPressObject(remote)
+	} else {
+		oldDst, getOldDstErr = nil, errors.New("Destination is source")
+	}
+	// Load metadata
+	err := o.loadMetadataIfNotLoaded()
 	if err != nil {
 		return nil, err
 	}
-	newFilename := generateMetadataName(remote)
-	moResult, err := do(o.mo, newFilename)
-	if err != nil {
-		return nil, err
+	// Copy over metadata if destination is not the source
+	var newFilename string
+	var moResult fs.Object
+	if remotesAreEqual {
+		newFilename = generateMetadataName(remote)
+		moResult, err = do(o.mo, newFilename)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		moResult = o.mo
 	}
 	// Copy over data
 	newFilename = generateDataNameFromCompressionMode(remote, src.Size(), o.meta.CompressionMode)
 	oResult, err := do(o.Object, newFilename)
 	if err != nil {
 		return nil, err
+	}
+	// Remove old dst if it existed and the new dst object remote is not equal to the old one
+	if getOldDstErr == nil {
+		if oldDst.Object.Remote() != newFilename {
+			err = oldDst.Object.Remove()
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	return f.newObject(oResult, moResult, o.meta), nil
 }
@@ -752,6 +896,8 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 //
 // If it isn't possible then return fs.ErrorCantMove
 func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
+	fmt.Printf("%s -> %s\n", src, remote)
+	// Get move feature
 	do := f.Fs.Features().Move
 	if do == nil {
 		return nil, fs.ErrorCantMove
@@ -760,21 +906,44 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 	if !ok {
 		return nil, fs.ErrorCantMove
 	}
-	// Move metadata
-	err := o.loadMetadataObjectIfNotLoaded()
+	// Get old file at destination remote if it exists and the destination is not the source
+	var oldDst *Object
+	var getOldDstErr error
+	remotesAreEqual := src.Remote() != remote || src.Fs().String() != f.String()
+	if remotesAreEqual {
+		oldDst, getOldDstErr = f.newPressObject(remote)
+	} else {
+		oldDst, getOldDstErr = nil, errors.New("Destination is source")
+	}
+	// Load metadata
+	err := o.loadMetadataIfNotLoaded()
 	if err != nil {
 		return nil, err
 	}
-	newFilename := generateMetadataName(remote)
-	moResult, err := do(o.mo, newFilename)
-	if err != nil {
-		return nil, err
+	// Move metadata if destination is not the source
+	var newFilename string
+	var moResult fs.Object
+	if remotesAreEqual {
+		newFilename = generateMetadataName(remote)
+		moResult, err = do(o.mo, newFilename)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		moResult = o.mo
 	}
 	// Move data
 	newFilename = generateDataNameFromCompressionMode(remote, src.Size(), o.meta.CompressionMode)
 	oResult, err := do(o.Object, newFilename)
 	if err != nil {
 		return nil, err
+	}
+	// Remove old dst if it existed
+	if getOldDstErr == nil {
+		err = oldDst.Object.Remove()
+		if err != nil {
+			return nil, err
+		}
 	}
 	return f.newObject(oResult, moResult, o.meta), nil
 }
@@ -788,6 +957,7 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 //
 // If destination exists then return fs.ErrorDirExists
 func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) error {
+	fmt.Println("DIRMOVE")
 	do := f.Fs.Features().DirMove
 	if do == nil {
 		return fs.ErrorCantDirMove
@@ -1204,6 +1374,10 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		// If we are, just update the object and metadata
 		newObject, err = o.f.putWithCustomFunctions(in, src, options, update, updateMeta, true)
 	}
+	// Check for errors
+	if err != nil {
+		return err
+	}
 	// Update object metadata and return
 	o.Object = newObject.Object
 	o.meta = newObject.meta
@@ -1262,6 +1436,11 @@ func (o *RenamedObjectInfo) Remote() string {
 // Size is unknown
 func (o *RenamedObjectInfo) Size() int64 {
 	return o.size
+}
+
+// Hash gets the hash of the RenamedObjectInfo
+func (o *RenamedObjectInfo) Hash(hash.Type) (string, error) {
+	return "", hash.ErrUnsupported
 }
 
 // ObjectInfo describes a wrapped fs.ObjectInfo for being the source

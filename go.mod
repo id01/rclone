@@ -27,8 +27,8 @@ require (
 	github.com/google/shlex v0.0.0-20181106134648-c34317bd91bf // indirect
 	github.com/gopherjs/gopherjs v0.0.0-20190411002643-bd77b112433e // indirect
 	github.com/hashicorp/golang-lru v0.5.1 // indirect
-	github.com/jlaffaye/ftp v0.0.0-20190519203911-8f5b34ce006f
 	github.com/id01/go-lz4 v1.0.3
+	github.com/jlaffaye/ftp v0.0.0-20190519203911-8f5b34ce006f
 	github.com/kardianos/govendor v1.0.9 // indirect
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0 // indirect
 	github.com/koofr/go-httpclient v0.0.0-20180104120329-03786175608a
